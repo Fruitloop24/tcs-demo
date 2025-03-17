@@ -1,248 +1,268 @@
-# Windows Active Directory Setup Guide
+# Windows Active Directory Setup Guide (On-Premises/VM)
 
-## Overview
-This guide documents the process of setting up a Windows Active Directory environment with role-based access control using Azure VMs. The environment includes a domain controller with three different user types, each with appropriate permissions and restrictions.
+## Prerequisites
 
-## Infrastructure Setup
+### Hardware Requirements
+- CPU: 4 cores minimum (2.0 GHz or faster)
+- RAM: 16GB minimum
+- Storage: 100GB minimum for OS drive
+- Network: 1Gbps NIC
 
-### Azure VM Creation via CLI
+### Software Requirements
+- Windows Server 2022 Standard/Datacenter ISO
+- Virtualization software (if using VM):
+  - VMware Workstation/Player
+  - VirtualBox
+  - Hyper-V
 
-```bash
-# Login to Azure
-az login
+## Step 1: Initial Server Setup
 
-# Create a resource group
-az group create --name ADDemo --location eastus
+### VM Creation (Skip if using physical hardware)
+1. Create a new VM with the following settings:
+   - Type: Windows Server 2022
+   - Memory: 16GB
+   - CPU: 4 cores
+   - Network: Bridged Adapter (important for domain connectivity)
+   - Storage: 100GB minimum
 
-# Create Windows Server 2022 VM with appropriate specs
-az vm create \
-  --resource-group ADDemo \
-  --name WinDC01 \
-  --image MicrosoftWindowsServer:WindowsServer:2022-Datacenter:latest \
-  --size Standard_D4s_v3 \
-  --admin-username azureadmin \
-  --admin-password "YourStrongPassword123!" \
-  --public-ip-sku Standard \
-  --nsg-rule RDP
+2. Mount the Windows Server 2022 ISO and install Windows Server
+   - Choose "Windows Server 2022 Standard/Datacenter (Desktop Experience)"
+   - Follow standard Windows installation steps
 
-# Open RDP port
-az vm open-port --resource-group ADDemo --name WinDC01 --port 3389
+### Network Configuration
+1. Set static IP address:
+   ```powershell
+   # Example configuration - adjust for your network
+   New-NetIPAddress -InterfaceAlias "Ethernet" -IPAddress "192.168.1.10" -PrefixLength 24 -DefaultGateway "192.168.1.1"
+   Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses "127.0.0.1"
+   ```
 
-# Get the public IP
-az vm show -d --resource-group ADDemo --name WinDC01 --query publicIps -o tsv
-```
+2. Rename computer (optional but recommended):
+   ```powershell
+   Rename-Computer -NewName "DC01" -Restart
+   ```
 
-### Connect to VM
-1. Use RDP or Azure Bastion to connect to the VM
-2. Login with the azureadmin credentials
+## Step 2: Active Directory Setup
 
-## Active Directory Setup
-
-### Install Active Directory Domain Services
-
+### Install AD DS Role
 #### PowerShell Method
 ```powershell
-# Install AD DS role
+# Install AD DS role and management tools
 Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools
 
 # Configure as domain controller
-$securePassword = ConvertTo-SecureString "Password123!" -AsPlainText -Force
+$securePassword = ConvertTo-SecureString "YourStrongPassword123!" -AsPlainText -Force
 Install-ADDSForest `
-  -DomainName "contoso.local" `
-  -DomainNetbiosName "CONTOSO" `
-  -SafeModeAdministratorPassword $securePassword `
-  -InstallDns:$true `
-  -Force:$true
+    -DomainName "contoso.local" `
+    -DomainNetbiosName "CONTOSO" `
+    -SafeModeAdministratorPassword $securePassword `
+    -InstallDns:$true `
+    -Force:$true
+
+# Server will restart automatically
 ```
 
 #### GUI Method
 1. Open Server Manager
 2. Click "Add Roles and Features"
-3. Select "Role-based or feature-based installation"
-4. Select the server from the pool
+3. Select "Role-based installation"
+4. Select your server
 5. Check "Active Directory Domain Services"
-6. Continue through the wizard and install
-7. After installation, click the notification flag and "Promote this server to a domain controller"
-8. Choose "Add a new forest" and enter "contoso.local" as the domain name
-9. Set the Directory Services Restore Mode password
-10. Complete the promotion wizard
+6. Install and wait for completion
+7. Click the notification flag and select "Promote this server to a domain controller"
+8. Choose "Add a new forest"
+9. Enter your domain name (e.g., "contoso.local")
+10. Set DSRM password
+11. Complete the wizard and allow restart
+
+## Step 3: Post-Installation Configuration
 
 ### Create Organizational Units (OUs)
-
-#### PowerShell Method
 ```powershell
-New-ADOrganizationalUnit -Name "Admins" -Path "DC=contoso,DC=local"
-New-ADOrganizationalUnit -Name "IT" -Path "DC=contoso,DC=local"
-New-ADOrganizationalUnit -Name "Employees" -Path "DC=contoso,DC=local"
+# Create main OUs
+$OUs = @("Admins", "IT", "Employees", "Computers", "Groups", "Service Accounts")
+foreach ($OU in $OUs) {
+    New-ADOrganizationalUnit -Name $OU -Path "DC=contoso,DC=local" -ProtectedFromAccidentalDeletion $true
+}
 ```
 
-#### GUI Method
-1. Open "Active Directory Users and Computers"
-2. Right-click on the domain (contoso.local)
-3. Select New > Organizational Unit
-4. Create the three OUs: Admins, IT, and Employees
-
-### Create Groups
-
-#### PowerShell Method
+### Create and Configure Groups
 ```powershell
-New-ADGroup -Name "IT Staff" -GroupScope Global -Path "OU=IT,DC=contoso,DC=local"
+# Create groups
+$Groups = @{
+    "IT Admins" = "OU=Groups,DC=contoso,DC=local"
+    "Help Desk" = "OU=Groups,DC=contoso,DC=local"
+    "Regular Users" = "OU=Groups,DC=contoso,DC=local"
+}
+
+foreach ($Group in $Groups.Keys) {
+    New-ADGroup -Name $Group -GroupScope Global -Path $Groups[$Group]
+}
 ```
 
-#### GUI Method
-1. In "Active Directory Users and Computers"
-2. Navigate to OU=IT
-3. Right-click > New > Group
-4. Enter "IT Staff" as the name
-5. Select "Global" for Group scope
-
-### Create Users
-
-#### PowerShell Method
+### Create Test Users
 ```powershell
-# Create Alice (Admin)
-New-ADUser -Name "Alice Admin" -GivenName Alice -Surname Admin -SamAccountName alice -UserPrincipalName alice@contoso.local -Path "OU=Admins,DC=contoso,DC=local" -AccountPassword (ConvertTo-SecureString "Pass123!" -AsPlainText -Force) -Enabled $true
+# Function to create user
+function New-DemoUser {
+    param(
+        [string]$Name,
+        [string]$Username,
+        [string]$Path,
+        [string[]]$Groups
+    )
+    
+    $securePassword = ConvertTo-SecureString "Welcome123!" -AsPlainText -Force
+    
+    New-ADUser -Name $Name `
+        -SamAccountName $Username `
+        -UserPrincipalName "$Username@contoso.local" `
+        -Path $Path `
+        -AccountPassword $securePassword `
+        -Enabled $true `
+        -PasswordNeverExpires $true `
+        -ChangePasswordAtLogon $false
+    
+    foreach ($Group in $Groups) {
+        Add-ADGroupMember -Identity $Group -Members $Username
+    }
+}
 
-# Create Bob (IT Staff)
-New-ADUser -Name "Bob IT" -GivenName Bob -Surname IT -SamAccountName bob -UserPrincipalName bob@contoso.local -Path "OU=IT,DC=contoso,DC=local" -AccountPassword (ConvertTo-SecureString "Pass123!" -AsPlainText -Force) -Enabled $true
-
-# Create Charlie (Regular User)
-New-ADUser -Name "Charlie User" -GivenName Charlie -Surname User -SamAccountName charlie -UserPrincipalName charlie@contoso.local -Path "OU=Employees,DC=contoso,DC=local" -AccountPassword (ConvertTo-SecureString "Pass123!" -AsPlainText -Force) -Enabled $true
+# Create sample users
+New-DemoUser -Name "John Admin" -Username "jadmin" -Path "OU=Admins,DC=contoso,DC=local" -Groups @("Domain Admins", "IT Admins")
+New-DemoUser -Name "Sarah Help" -Username "shelp" -Path "OU=IT,DC=contoso,DC=local" -Groups @("Help Desk")
+New-DemoUser -Name "Bob User" -Username "buser" -Path "OU=Employees,DC=contoso,DC=local" -Groups @("Regular Users")
 ```
 
-#### GUI Method
-1. In "Active Directory Users and Computers"
-2. Navigate to the appropriate OU
-3. Right-click > New > User
-4. Fill in the user details
-5. Set a password and mark "Password never expires"
-6. Complete the wizard
+## Step 4: Group Policy Configuration
 
-### Assign Groups and Permissions
-
-#### PowerShell Method
+### Create and Link GPOs
 ```powershell
-# Add Alice to Domain Admins
-Add-ADGroupMember -Identity "Domain Admins" -Members alice
+# Create GPOs
+$GPOs = @{
+    "Security Baseline" = "DC=contoso,DC=local"
+    "IT Restrictions" = "OU=IT,DC=contoso,DC=local"
+    "User Restrictions" = "OU=Employees,DC=contoso,DC=local"
+}
 
-# Add Bob to IT Staff
-Add-ADGroupMember -Identity "IT Staff" -Members bob
-
-# Grant Bob password reset rights for Employees
-dsacls "OU=Employees,DC=contoso,DC=local" /G "CONTOSO\bob:RPWP;userPassword"
-dsacls "OU=Employees,DC=contoso,DC=local" /G "CONTOSO\bob:RP;*"
+foreach ($GPO in $GPOs.Keys) {
+    New-GPO -Name $GPO | New-GPLink -Target $GPOs[$GPO]
+}
 ```
 
-#### GUI Method
-For adding to groups:
-1. Open user properties
-2. Go to "Member Of" tab
-3. Click "Add" and search for the group
-4. Add and apply
+## Step 5: DNS Configuration
 
-For delegation:
-1. In "Active Directory Users and Computers"
-2. Right-click the Employees OU
-3. Select "Delegate Control"
-4. Add Bob and delegate "Reset user passwords and force password change at next logon"
-
-## Group Policy Configuration
-
-### Create GPOs
-
-#### PowerShell Method
+### Verify DNS Settings
 ```powershell
-# Create policies
-New-GPO -Name "IT Staff Restrictions"
-New-GPO -Name "Employee Restrictions"
+# Verify DNS is working
+Get-DnsServerZone
+Get-DnsServerForwarder
 
-# Link policies to OUs
-New-GPLink -Name "IT Staff Restrictions" -Target "OU=IT,DC=contoso,DC=local"
-New-GPLink -Name "Employee Restrictions" -Target "OU=Employees,DC=contoso,DC=local"
+# Add forwarders if needed (example using Google DNS)
+Add-DnsServerForwarder -IPAddress 8.8.8.8, 8.8.4.4
 ```
 
-#### GUI Method
-1. Open "Group Policy Management"
-2. Expand the forest > Domains > contoso.local
-3. Right-click on "Group Policy Objects" and select "New"
-4. Create the two policies
-5. To link: right-click on the OU and select "Link an Existing GPO"
+## Step 6: Verify Setup
 
-### Configure Policy Settings
-
-#### PowerShell Method for IT Staff Restrictions
+### Check Domain Controller Status
 ```powershell
-$gpo = Get-GPO -Name "IT Staff Restrictions"
-# Prevent software installation
-Set-GPRegistryValue -Name $gpo.DisplayName -Key "HKLM\Software\Policies\Microsoft\Windows\Installer" -ValueName "DisableMSI" -Type DWord -Value 1
+# Verify AD DS services
+dcdiag /v
+
+# Check replication status (for multiple DCs)
+repadmin /showrepl
+
+# Verify DNS
+nslookup contoso.local
 ```
 
-#### PowerShell Method for Employee Restrictions
+## Joining Computers to the Domain
+
+### For Windows 10/11 Professional or Enterprise:
+
+1. Set the computer's DNS to point to your domain controller:
+   ```powershell
+   Set-DnsClientServerAddress -InterfaceAlias "Ethernet" -ServerAddresses "192.168.1.10"
+   ```
+
+2. Join the domain (PowerShell as Administrator):
+   ```powershell
+   Add-Computer -DomainName "contoso.local" -Restart
+   ```
+
+   Or using GUI:
+   1. Open System Properties (Win + Pause/Break)
+   2. Click "Change settings" under Computer name
+   3. Click "Change"
+   4. Select "Domain" and enter "contoso.local"
+   5. Enter domain admin credentials when prompted
+   6. Restart the computer
+
+### Troubleshooting Domain Join Issues
+
+1. Verify network connectivity:
+   ```powershell
+   Test-NetConnection -ComputerName DC01 -Port 389
+   ```
+
+2. Verify DNS resolution:
+   ```powershell
+   nslookup contoso.local
+   nslookup DC01.contoso.local
+   ```
+
+3. Check time synchronization:
+   ```powershell
+   w32tm /query /status
+   ```
+
+4. Common fixes:
+   - Ensure client DNS points to DC
+   - Verify firewall allows AD ports (see Step 1)
+   - Sync time with DC
+   - Clear DNS cache: `ipconfig /flushdns`
+
+## Security Best Practices
+
+1. Change default passwords
+2. Enable Windows Firewall
+3. Keep Windows updated
+4. Implement LAPS (Local Administrator Password Solution)
+5. Regular backup of System State
+6. Monitor Event Logs
+7. Implement password policies
+
+## Backup and Recovery
+
+### System State Backup
 ```powershell
-$gpo = Get-GPO -Name "Employee Restrictions"
-# Block Control Panel access
-Set-GPRegistryValue -Name $gpo.DisplayName -Key "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -ValueName "NoControlPanel" -Type DWord -Value 1
-# Prevent running executables
-Set-GPRegistryValue -Name $gpo.DisplayName -Key "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer" -ValueName "DisallowRun" -Type DWord -Value 1
-Set-GPRegistryValue -Name $gpo.DisplayName -Key "HKCU\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\DisallowRun" -ValueName "1" -Type String -Value "*.exe"
-# Block USB storage
-Set-GPRegistryValue -Name $gpo.DisplayName -Key "HKLM\Software\Policies\Microsoft\Windows\RemovableStorageDevices" -ValueName "Deny_All" -Type DWord -Value 1
+wbadmin start systemstatebackup -backupTarget:E:
 ```
 
-#### GUI Method
-1. In "Group Policy Management"
-2. Right-click on the GPO and select "Edit"
-3. Navigate to the appropriate section:
-   - For software installation restrictions: Computer Configuration > Policies > Administrative Templates > Windows Components > Windows Installer
-   - For Control Panel restrictions: User Configuration > Policies > Administrative Templates > Control Panel
-   - For removable storage: Computer Configuration > Policies > Administrative Templates > System > Removable Storage Access
-
-## Environment Overview
-
-### Organizational Structure
-- **Admins OU**: Contains administrative users with full domain privileges
-- **IT OU**: Contains IT support staff with limited administrative capabilities
-- **Employees OU**: Contains regular users with restricted permissions
-
-### User Roles and Permissions
-
-#### Alice (Administrator)
-- Member of: Domain Admins
-- Permissions: Full administrative control over the entire domain
-- Use Case: System administration, security configuration, user management
-
-#### Bob (IT Support)
-- Member of: IT Staff
-- Permissions:
-  - Can reset passwords for Employees
-  - Can view system information
-  - Limited software installation capabilities
-- Use Case: Help desk support, routine maintenance, user support
-
-#### Charlie (Regular Employee)
-- Restrictions:
-  - Cannot access Control Panel
-  - Cannot run executable files
-  - Cannot use removable storage
-- Use Case: Regular business operations with appropriate security limitations
-
-### Policy Implementation Logic
-The implementation follows the principle of least privilege:
-1. Administrative users have full control but are limited in number
-2. IT support has targeted permissions required for their role
-3. Regular users have restrictions to prevent unauthorized system changes
-
-This setup demonstrates a secure, role-based access control system that can be easily extended for more complex organizational structures.
-
-## Verification and Testing
-To verify the setup works correctly:
-1. Log in as each user type
-2. Attempt actions that should be allowed/restricted based on their role
-3. Check Group Policy application with `gpresult /r` command
-4. Verify password reset functionality for Bob on Charlie's account
-
-## Cleanup (When No Longer Needed)
-```bash
-# Delete the resource group and all resources
-az group delete --name ADDemo --yes
+### Create System State Backup Task
+```powershell
+$action = New-ScheduledTaskAction -Execute 'wbadmin' -Argument 'start systemstatebackup -backupTarget:E:'
+$trigger = New-ScheduledTaskTrigger -Daily -At 3AM
+Register-ScheduledTask -Action $action -Trigger $trigger -TaskName "AD Backup" -Description "Daily System State Backup"
 ```
+
+## Monitoring and Maintenance
+
+### Create Health Check Script
+```powershell
+# Save as C:\Scripts\AD-HealthCheck.ps1
+$checks = @{
+    "AD DS Service" = {(Get-Service NTDS).Status -eq "Running"}
+    "DNS Service" = {(Get-Service DNS).Status -eq "Running"}
+    "File System" = {(Get-PSDrive C).Free -gt 10GB}
+    "DCDiag" = {(dcdiag /test:services /test:replications).Contains("passed test")}
+}
+
+$results = foreach ($check in $checks.Keys) {
+    [PSCustomObject]@{
+        Check = $check
+        Status = if (& $checks[$check]) {"Healthy"} else {"Error"}
+        Time = Get-Date
+    }
+}
+
+$results | Export-Csv -Path "C:\Logs\AD-Health-$(Get-Date -Format 'yyyyMMdd').csv" -NoTypeInformation
